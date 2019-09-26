@@ -12,6 +12,8 @@ int SOLOUT = 4;
 int LEDOUT = 5;
 int RELOUT = 10;
 int BUZOUT = 12;
+const float dropTolerance = 0.5f;
+float calibratedPressure  = 1000.0f;
 
 #define SEALEVELPRESSURE_HPA (1013.25)
 
@@ -25,8 +27,8 @@ KalmanFilter presKF = KalmanFilter(0.1, 10);
 KalmanFilter gasBKF = KalmanFilter(0.1, 10);
 KalmanFilter gasMKF = KalmanFilter(0.1, 10);
 
-long veriTime = 3600000;//1 hour verify sensors
-long presTime = 60000;//max on time for 1 minute * pot ratio
+long lastVerified = 0;
+long veriTime = 1800000;//30 min verify sensors
 long reseTime = 21600000;//reset every 6 hours
 
 long pressurePrevious;
@@ -56,19 +58,23 @@ void SetLCDDisplay(String line1, String line2) {
 }
 
 void startup() {
-  threeBeep(100, 100, 100, 200, 200, 200);
+  threeBeep(BUZOUT, 100, 100, 100, 200, 200, 200);
 }
 
 void success() {
-  threeBeep(100, 100, 100, 50, 50, 50);
+  threeBeep(BUZOUT, 100, 100, 100, 50, 50, 50);
 }
 
 void pass() {
-  threeBeep(50, 50, 50, 20, 20, 20);
+  threeBeep(LEDOUT, 50, 50, 50, 20, 20, 20);
 }
 
 void fail() {
-  threeBeep(300, 300, 300, 300, 300, 300);
+  threeBeep(LEDOUT, 300, 300, 300, 300, 300, 300);
+}
+
+void error() {
+  threeBeep(LEDOUT, 500, 500, 500, 250, 250, 250);
 }
 
 void setup() {
@@ -118,41 +124,104 @@ void setup() {
 }
 
 void loop() {
-  SetLCDDisplay("Sampling...", "MQ131...");
-  MQ131.sample();
-  SetLCDDisplay("Sampling...", "BME680...");
-  if (!bme.performReading()) {
+  long currentMillis = millis();
+
+  if (currentMillis > reseTime){
+    SetLCDDisplay("Rebooting...", "5 seconds.");
+    delay(5000);
     ResetArduino();
     return;
   }
-  SetLCDDisplay("Running...", "");
+
+  if (currentMillis > veriTime + lastVerified){
+    lastVerified = currentMillis;
+    verifySensors("Verifying...");
+  }
+  
+  //SetLCDDisplay("Running...", "MQ131...");
+  MQ131.sample();
+  //delay(500);
+  //SetLCDDisplay("Running...", "BME680...");
+  if (!bme.performReading()) {
+    SetLCDDisplay("Failure...", "BME680 error");
+    delay(5000);
+    ResetArduino();
+    return;
+  }
+  //delay(500);
 
   long currentTime = millis();
-  float ozon = MQ131.getO3(PPM);
-  float temp = bme.temperature;
-  float pres = bme.pressure / 0.0f;
-  float humi = bme.humidity;
-  float gasr = bme.gas_resistance / 1000.0f;
+  float ozon = gasBKF.Filter(MQ131.getO3(PPM));
+  float temp = tempKF.Filter(bme.temperature);
+  float pres = presKF.Filter(bme.pressure / 100.0f);
+  float humi = humiKF.Filter(bme.humidity);
+  float gasr = gasMKF.Filter(bme.gas_resistance / 1000.0f);
 
-  if (digitalRead(BUTIN) == LOW) {
-    digitalWrite(BUZOUT, HIGH);
+  // 984.3  + 0.5 < 985 -> engage
+  // 985 + 0.5 < 985
+
+  if(temp > 40 || temp < 10){
+    digitalWrite(LEDOUT, LOW);
+    digitalWrite(SOLOUT, LOW);
+    digitalWrite(RELOUT, LOW);
+    
+    SetLCDDisplay("Failure...", "Temperature");
+    error();
+
+    delay(20000);
+    
+    ResetArduino();
+    return;
+  }
+  else if (humi > 95){
+    digitalWrite(LEDOUT, LOW);
+    digitalWrite(SOLOUT, LOW);
+    digitalWrite(RELOUT, LOW);
+    
+    SetLCDDisplay("Failure...", "Humidity");
+    error();
+
+    delay(20000);
+    
+    ResetArduino();
+    return;
+  }
+  else if (ozon > 25.0f){
+    digitalWrite(LEDOUT, LOW);
+    digitalWrite(SOLOUT, LOW);
+    digitalWrite(RELOUT, LOW);
+    
+    SetLCDDisplay("Failure...", "External O3");
+    error();
+
+    delay(20000);
+    
+    ResetArduino();
+    return;
+  }
+  else if (!digitalRead(BUTIN)){
+    SetLCDDisplay("Purge...", "Open Chamber...");
+    digitalWrite(LEDOUT, HIGH);
+    digitalWrite(SOLOUT, HIGH);
+
+    delay(5000);
+  }
+  else if (pres + dropTolerance < calibratedPressure && gasr < analogRead(POTIN) * 12){
+    //digitalWrite(BUZOUT, HIGH);
     digitalWrite(LEDOUT, HIGH);
     digitalWrite(SOLOUT, HIGH);
     digitalWrite(RELOUT, HIGH);
   }
   else {
-    digitalWrite(BUZOUT, LOW);
+    //digitalWrite(BUZOUT, LOW);
     digitalWrite(LEDOUT, LOW);
     digitalWrite(SOLOUT, LOW);
     digitalWrite(RELOUT, LOW);
   }
 
-  SetLCDDisplay(String(ozon) + " " +
-                String(temp) + " " +
-                String(pres),
-                String(humi) + " " +
-                String(gasr) + " " +
-                String(digitalRead(BUTIN))
+  SetLCDDisplay("Running...",
+                "X:" + String(ozon * 1.43f, 1) + 
+                " I:" + String(gasr / 129.17f, 0)
                );
 
   delay(1000);
@@ -181,6 +250,36 @@ void initializeBME() {
   SetLCDDisplay(topLine, "Heating...");
   bme.setGasHeater(320, 150); // 320*C for 150 ms
 
+  pass();
+  delay(1000);
+
+  SetLCDDisplay(topLine, "Calibrating...");
+  delay(1000);
+  
+  SetLCDDisplay(topLine, "Open Chamber...");
+  digitalWrite(SOLOUT, HIGH);
+
+  float sum = 0.0f;
+
+  for (int i = 0; i < 10; i++){
+    if (!bme.performReading()) {
+      ResetArduino();
+      return;
+    }
+
+    sum += bme.pressure / 100.0f;
+
+    delay(200);
+  }
+  
+  calibratedPressure = sum / 10.0f;
+  
+  SetLCDDisplay(topLine, "Close Chamber...");
+  digitalWrite(SOLOUT, LOW);
+  delay(500);
+  
+  SetLCDDisplay(topLine, "Done: " + String(calibratedPressure));
+  
   pass();
   delay(1000);
 }
@@ -283,19 +382,19 @@ bool testDevice(byte address) {
     return false;
 }
 
-void threeBeep(int a, int b, int c, int ad, int bd, int cd) {
-  digitalWrite(BUZOUT, HIGH);
+void threeBeep(int pin, int a, int b, int c, int ad, int bd, int cd) {
+  digitalWrite(pin, HIGH);
   delay(a);
-  digitalWrite(BUZOUT, LOW);
+  digitalWrite(pin, LOW);
   delay(ad);
 
-  digitalWrite(BUZOUT, HIGH);
+  digitalWrite(pin, HIGH);
   delay(b);
-  digitalWrite(BUZOUT, LOW);
+  digitalWrite(pin, LOW);
   delay(bd);
 
-  digitalWrite(BUZOUT, HIGH);
+  digitalWrite(pin, HIGH);
   delay(c);
-  digitalWrite(BUZOUT, LOW);
+  digitalWrite(pin, LOW);
   delay(cd);
 }
